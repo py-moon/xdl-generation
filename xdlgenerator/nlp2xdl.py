@@ -7,6 +7,8 @@ import numpy as np
 import openai
 from tqdm import tqdm
 
+from constraint_bootstrap import ConstraintBootstrapTrainer, load_training_samples
+
 wd = os.getcwd()
 root_dir = "/".join(wd.split("/"))
 sys.path.append(root_dir)
@@ -110,12 +112,84 @@ def generate_xdl(file_path, available_hardware=None, available_reagents=None):
         return correct_syntax, "The correct XDL could not be generated.", errors
 
 
+def suggest_constraints_from_failure(payload):
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are improving a XDL generator. "
+                    "Given task description, invalid XDL, and verifier errors, "
+                    "return a JSON list of concise syntax/parameter validity constraints."
+                ),
+            },
+            {"role": "user", "content": payload},
+        ],
+        temperature=0,
+        max_tokens=300,
+    )
+    content = response["choices"][0]["message"]["content"].strip()
+    try:
+        constraints = json.loads(content)
+    except json.JSONDecodeError:
+        constraints = [line.strip("- ") for line in content.split("\n") if line.strip()]
+    return [item for item in constraints if isinstance(item, str)]
+
+
+def generate_xdl_with_constraints(description, constraints_text):
+    xdl_definition = open("XDL_description.txt", "r").read()
+    full_prompt = description
+    if constraints_text:
+        full_prompt = f"{description}\n\nConstraint rules:\n{constraints_text}"
+    output = prompt(full_prompt, xdl_definition, 1000)
+    if "<XDL>" not in output:
+        return output
+    return output[output.index("<XDL>"):]
+
+
+def run_constraint_bootstrap(
+    input_dir,
+    rounds,
+    stable_window,
+    stable_tolerance,
+    min_rounds,
+    output_path,
+):
+    samples = load_training_samples(input_dir)
+    trainer = ConstraintBootstrapTrainer(
+        generate_xdl_fn=generate_xdl_with_constraints,
+        suggest_constraints_fn=suggest_constraints_from_failure,
+    )
+    result = trainer.train(
+        samples=samples,
+        rounds=rounds,
+        stable_window=stable_window,
+        stable_tolerance=stable_tolerance,
+        min_rounds=min_rounds,
+    )
+    with open(output_path, "w") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"Constraint bootstrap result saved to {output_path}")
+    if result["constraints"]:
+        print("Learned constraints:")
+        for rule in result["constraints"]:
+            print(f"- {rule}")
+    print("Accuracy history:", result["accuracy_history"])
+
+
 def main():
     """main."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_dir", required=True)
     parser.add_argument("--avail_hardware", default=None, type=str)
     parser.add_argument("--avail_reagents", default=None, type=str)
+    parser.add_argument("--bootstrap_constraints", action="store_true")
+    parser.add_argument("--bootstrap_rounds", default=10, type=int)
+    parser.add_argument("--stable_window", default=3, type=int)
+    parser.add_argument("--stable_tolerance", default=0.01, type=float)
+    parser.add_argument("--min_rounds", default=3, type=int)
+    parser.add_argument("--bootstrap_output", default="constraint_bootstrap_result.json", type=str)
     args = parser.parse_args()
     if args.input_dir[-1] == "/":
         args.input_dir = args.input_dir[:-1]
@@ -135,6 +209,17 @@ def main():
         with open(args.avail_reagents) as f:
             available_reagents= f.read().split("\n")
     print("available reagents:", available_reagents)
+
+    if args.bootstrap_constraints:
+        run_constraint_bootstrap(
+            input_dir=args.input_dir,
+            rounds=args.bootstrap_rounds,
+            stable_window=args.stable_window,
+            stable_tolerance=args.stable_tolerance,
+            min_rounds=args.min_rounds,
+            output_path=args.bootstrap_output,
+        )
+        return
 
     num_correct = 0
     total_num = 0
